@@ -25,10 +25,24 @@ def extract_text(filename: str, raw: bytes) -> str:
 
 
 def _extract_pdf(raw: bytes) -> str:
+    # pypdf 우선(pdfplumber보다 ~5배 빠름). 실패 시 pdfplumber 폴백.
+    try:
+        import pypdf
+        reader = pypdf.PdfReader(io.BytesIO(raw))
+        out = []
+        for page in reader.pages:
+            out.append(page.extract_text() or "")
+        text = "\n".join(out)
+        # pypdf가 텍스트를 거의 못 뽑으면(레이아웃 복잡) 폴백 시도
+        if len(text.strip()) >= 20:
+            return text
+    except Exception:
+        pass
+    # 폴백: pdfplumber (느리지만 견고)
     try:
         import pdfplumber
     except Exception:
-        raise RuntimeError("pdfplumber가 필요해요: pip install pdfplumber")
+        raise RuntimeError("pdf 추출 라이브러리가 필요해요: pip install pypdf")
     out = []
     with pdfplumber.open(io.BytesIO(raw)) as pdf:
         for page in pdf.pages:
@@ -96,4 +110,3 @@ def _pdf_first_page_png(raw: bytes) -> bytes:
         im = page.to_image(resolution=150).original
         buf = io.BytesIO(); im.save(buf, format="PNG")
         return buf.getvalue()
-
