@@ -244,15 +244,14 @@ class NeuralMarkovEngine:
         self.dim = embedding_dim
         tokens = ko_tokenize(corpus_text)
 
-        # 마르코프 — epochs 만큼 반복 카운팅
-        tokens_ep = tokens * epochs
-        self.total = len(tokens_ep)
-        for i, t in enumerate(tokens_ep):
+        # 마르코프 카운팅 (토큰 복제 불필요 — 확률은 동일, 복제는 낭비였음)
+        self.total = len(tokens)
+        for i, t in enumerate(tokens):
             self.uni[t] += 1
-            if i >= 1: self.bi[tokens_ep[i-1]][t] += 1
-            if i >= 2: self.tri[(tokens_ep[i-2], tokens_ep[i-1])][t] += 1
+            if i >= 1: self.bi[tokens[i-1]][t] += 1
+            if i >= 2: self.tri[(tokens[i-2], tokens[i-1])][t] += 1
 
-        # [B] 공기어 통계(PMI용) — 원본 토큰 기준(반복 제외)으로 창 내 동시등장
+        # [B] 공기어 통계(PMI용) — 판정에 실제 쓰이는 부분
         w = self.cooc_window
         for i, t in enumerate(tokens):
             for j in range(max(0, i - w), min(len(tokens), i + w + 1)):
@@ -263,15 +262,10 @@ class NeuralMarkovEngine:
         # 어휘 구축
         self.idx2word = list(self.uni.keys())
         self.word2idx = {w: i for i, w in enumerate(self.idx2word)}
-        V = len(self.idx2word)
 
-        # TinyTransformer 학습
-        ids = [self.word2idx[t] for t in tokens if t in self.word2idx]
-        self.model = WordTransformer(
-            vocab_size=V, dim=embedding_dim,
-            n_layers=1, max_len=128, seed=42,
-        )
-        self.model.fit(ids, epochs=epochs, lr=0.05, seq_len=32, on_epoch=on_epoch)
+        # TinyTransformer 제거: 판정 로직(_score_jm, _semantic_bonus)이
+        # self.model을 전혀 쓰지 않음(PMI로 대체됨). 학습만 시간 낭비였음.
+        self.model = None
         self.is_trained = True
 
         # 캘리브레이션
