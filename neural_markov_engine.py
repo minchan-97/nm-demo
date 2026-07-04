@@ -17,12 +17,18 @@ from collections import defaultdict, Counter
 from typing import List, Tuple, Dict, Optional
 
 try:
-    from korean_tokenizer import tokenize as ko_tokenize, tokenize_dual
+    # Kiwi 기반(어간 추출) 우선 — 어미 문제 해결.
+    # Kiwi 미설치 시 내부에서 규칙 토크나이저로 자동 폴백.
+    from korean_tokenizer_kiwi import tokenize as ko_tokenize, tokenize_dual
     _KO = True
 except Exception:
-    _KO = False
-    def ko_tokenize(text): return text.strip().split()
-    def tokenize_dual(text): return [(w, w) for w in text.strip().split()]
+    try:
+        from korean_tokenizer import tokenize as ko_tokenize, tokenize_dual
+        _KO = True
+    except Exception:
+        _KO = False
+        def ko_tokenize(text): return text.strip().split()
+        def tokenize_dual(text): return [(w, w) for w in text.strip().split()]
 
 
 # ── 유틸 ──────────────────────────────────────────────────────
@@ -215,6 +221,10 @@ class NeuralMarkovEngine:
         # 마르코프
         self.uni = Counter(); self.bi = defaultdict(Counter)
         self.tri = defaultdict(Counter); self.total = 0
+        # [B] 공기어 통계(PMI 보정용, 투명)
+        self.cooc = defaultdict(Counter)   # 같은 창 안에 함께 나온 횟수
+        self.cooc_window = 3
+        self.cooc_total = 0
         # 신경망
         self.word2idx: Dict[str, int] = {}
         self.idx2word: List[str] = []
@@ -225,6 +235,9 @@ class NeuralMarkovEngine:
         # 캘리브레이션
         self.mu:  float = 0.0
         self.std: float = 1.0
+        self.p50: float = -5.0
+        self.p10: float = -8.0
+        self.spread: float = 3.0
 
     def train(self, corpus_text: str, embedding_dim: int = 32,
               epochs: int = 20, on_epoch=None):
@@ -238,6 +251,14 @@ class NeuralMarkovEngine:
             self.uni[t] += 1
             if i >= 1: self.bi[tokens_ep[i-1]][t] += 1
             if i >= 2: self.tri[(tokens_ep[i-2], tokens_ep[i-1])][t] += 1
+
+        # [B] 공기어 통계(PMI용) — 원본 토큰 기준(반복 제외)으로 창 내 동시등장
+        w = self.cooc_window
+        for i, t in enumerate(tokens):
+            for j in range(max(0, i - w), min(len(tokens), i + w + 1)):
+                if j != i:
+                    self.cooc[t][tokens[j]] += 1
+            self.cooc_total += 1
 
         # 어휘 구축
         self.idx2word = list(self.uni.keys())
@@ -256,19 +277,67 @@ class NeuralMarkovEngine:
         # 캘리브레이션
         self._calibrate(corpus_text)
 
+    def _paraphrase_endings(self, sent):
+        """
+        문장의 종결어미를 변형한 버전들 생성(캘리브레이션 현실화용).
+        원본 문체(-다)만으로 캘리브레이션하면 실제 입력(-습니다 등)과
+        분포가 어긋나므로, 흔한 어미 변형을 만들어 분포를 넓힌다.
+        규칙 기반(투명) — 완벽한 활용이 아니라 logP 분포 근사가 목적.
+        """
+        s = sent.rstrip('.。 ')
+        variants = [sent]
+        # 흔한 종결 변환 (근사)
+        endings = [
+            ('한다', ['합니다', '해요', '함']),
+            ('된다', ['됩니다', '돼요', '됨']),
+            ('이다', ['입니다', '이에요', '임']),
+            ('있다', ['있습니다', '있어요', '있음']),
+            ('없다', ['없습니다', '없어요', '없음']),
+            ('진다', ['집니다', '져요', '짐']),
+            ('간다', ['갑니다', '가요', '감']),
+            ('온다', ['옵니다', '와요', '옴']),
+            ('연다', ['엽니다', '열어요']),
+            ('준다', ['줍니다', '줘요']),
+            ('取한다', ['取합니다']),
+        ]
+        for base, repls in endings:
+            if s.endswith(base):
+                stem = s[:-len(base)]
+                for r in repls:
+                    variants.append(stem + r + '.')
+                break
+        else:
+            # 일반 '-다' → '-습니다/-ㅂ니다' 근사
+            if s.endswith('다'):
+                variants.append(s[:-1] + '습니다.')
+                variants.append(s[:-1] + '어요.')
+        return variants
+
     def _calibrate(self, corpus_text: str):
-        """원본 문장들로 logP 기준점 계산"""
+        """
+        [D·재설계] 원본 + 어미변형 문장으로 logP 분포 계산.
+        실제 입력(다양한 문체)과 캘리브레이션 분포를 정합시킨다.
+        """
         import numpy as _np
-        sents  = [s.strip() for s in corpus_text.split('\n')
-                  if s.strip() and len(s.strip()) > 8]
-        scores = []
-        for s in sents[:100]:
-            r  = self.evaluate(s)
-            lp = r.get('avg_logp', -20.0)
-            if lp > -50: scores.append(lp)
+        sents = [s.strip() for s in corpus_text.split('\n')
+                 if s.strip() and len(s.strip()) > 8]
+        scores, seen = [], set()
+        for s in sents:
+            if s in seen:
+                continue
+            seen.add(s)
+            # 원본 + 어미변형 모두 캘리브레이션에 포함
+            for v in self._paraphrase_endings(s):
+                r = self.evaluate(v, _calibrating=True)
+                lp = r.get('avg_logp', -20.0)
+                if lp > -50:
+                    scores.append(lp)
         if scores:
-            self.mu  = float(_np.mean(scores))
-            self.std = max(float(_np.std(scores)), 2.0)
+            arr = _np.array(scores)
+            self.mu = float(_np.mean(arr))
+            # std 하한을 넉넉히(2.5): 정상 표현 변주(연결어미·어순·동의어)를
+            # 흡수하고, 환각(logP가 크게 낮은)만 확실히 걸러내기 위함.
+            self.std = max(float(_np.std(arr)), 2.5)
 
     def _get_vec(self, word: str) -> Optional[np.ndarray]:
         if word in self.word2idx and self.model:
@@ -286,31 +355,43 @@ class NeuralMarkovEngine:
         "나요", "가요", "해요", "되요", "네요",
     }
 
-    def _semantic_bonus(self, token: str, logp: float) -> float:
+    def _semantic_bonus(self, token: str, logp: float, context=None):
         """
-        마르코프가 낮게 잡은 토큰에 의미 보정 적용.
-        TinyTransformer 임베딩으로 코퍼스 어휘와 유사도 측정.
+        [B·변형] 투명한 PMI 기반 의미 보정.
+        트랜스포머 임베딩(블랙박스) 대신 공기어 통계(PMI)로,
+        '이 토큰이 자료에서 문맥 단어들과 얼마나 함께 나오는가'를 본다.
+        완전 투명 — 왜 보정됐는지 근거(어떤 공기어) 반환.
+        반환: (bonus, reason_words)
         """
-        if self.model is None: return 0.0
-        # 기능어는 보정 없이 무시 (패널티도 없음)
-        if token in self._FUNCTION_WORDS: return 3.0  # 통과
-        vec = self._get_vec(token)
-        if vec is None: return 0.0
-
-        sample_words = [w for w, c in self.uni.most_common(300)]
-        sims = []
-        for w in sample_words:
-            v2 = self._get_vec(w)
-            if v2 is not None:
-                sims.append(float(np.dot(vec, v2)))
-        if not sims: return 0.0
-        max_sim = max(sims)
-
-        # 유사도 0.5 이상이면 보정 (임계값 낮춤)
-        if max_sim > 0.5:
-            bonus = (max_sim - 0.5) / 0.5 * 5.0  # 최대 5점 보정
-            return bonus
-        return 0.0
+        if token in self._FUNCTION_WORDS:
+            return 3.0, ["기능어"]
+        if token not in self.cooc or self.cooc_total == 0:
+            return 0.0, []
+        # 문맥 단어들과의 PMI 평균 (context 없으면 자료 최빈어 기준)
+        ctx = context if context else [w for w, _ in self.uni.most_common(50)]
+        p_t = self.uni[token] / self.total if self.total else 1e-9
+        pmis = []
+        reasons = []
+        for c in ctx:
+            if c == token or c not in self.uni:
+                continue
+            joint = self.cooc[token][c]
+            if joint <= 0:
+                continue
+            p_c = self.uni[c] / self.total
+            p_joint = joint / self.cooc_total
+            pmi = np.log((p_joint + 1e-12) / (p_t * p_c + 1e-12))
+            if pmi > 0:
+                pmis.append(pmi)
+                reasons.append(c)
+        if not pmis:
+            return 0.0, []
+        # 상위 공기어들의 PMI로 보정 (최대 5점)
+        pmis_sorted = sorted(pmis, reverse=True)[:3]
+        top_reasons = [r for _, r in sorted(zip(pmis, reasons), reverse=True)][:3]
+        avg_pmi = float(np.mean(pmis_sorted))
+        bonus = float(min(5.0, avg_pmi))
+        return bonus, top_reasons
 
     def _score_jm(self, tokens: List[str]):
         V = len(self.uni)
@@ -331,10 +412,12 @@ class NeuralMarkovEngine:
             lp_raw = float(np.log(p_jm + 1e-12))
             in_graph = (p2 > 0 or p3 > 0)
 
-            # 의미 보정 (마르코프가 낮게 잡은 경우 적용)
+            # [B·변형] 투명 PMI 의미 보정 (문맥=주변 토큰)
             bonus = 0.0
+            reasons = []
             if lp_raw < -5.0:
-                bonus = self._semantic_bonus(wc, lp_raw)
+                context = tokens[max(0, t-3):t]   # 직전 문맥
+                bonus, reasons = self._semantic_bonus(wc, lp_raw, context)
             lp_corrected = lp_raw + bonus
 
             total_lp += lp_corrected
@@ -344,6 +427,7 @@ class NeuralMarkovEngine:
                 "logp_raw": lp_raw,
                 "logp": lp_corrected,
                 "bonus": bonus,
+                "bonus_reason": reasons,   # 왜 보정됐나(투명)
                 "in_graph": in_graph,
                 "outlier": is_outlier,
             })
@@ -357,7 +441,7 @@ class NeuralMarkovEngine:
         return float((1.0 - np.mean(sims)) / 2.0)
 
     def evaluate(self, text: str, logp_thr: float = -8.0,
-                 mis_thr: float = 0.55) -> dict:
+                 mis_thr: float = 0.55, _calibrating: bool = False) -> dict:
         import time
         t0 = time.perf_counter()
         pairs = tokenize_dual(text)
@@ -371,30 +455,29 @@ class NeuralMarkovEngine:
         for i, p in enumerate(per):
             p["raw_token"] = raw_tokens[i + 2] if i + 2 < len(raw_tokens) else p["token"]
 
-        mismatch = self._score_mismatch(tokens)
         elapsed_ms = (time.perf_counter() - t0) * 1000
 
-        mf = avg_logp < logp_thr; ef = mismatch > mis_thr
+        # [D·변형] 동적 임계값: 이 자료 원본 문장 분포(mu, std) 기준 몇 σ 벗어났나.
+        # [C] mismatch 제거.
+        # 캘리브레이션 중이면 raw logP만 반환(순환 방지)
+        if _calibrating:
+            return {"status": "CALIB", "avg_logp": avg_logp, "per_token": per}
 
-        # 3구간 판정
-        # PASS:     logP > -10          → 도메인 안
-        # WARNING:  -10 ~ -12           → 경계 (도메인 안이지만 이상한 것 포함)
-        # FATAL:    logP < -14          → 도메인 완전 이탈
-        if avg_logp >= -10.0 and not ef:
-            status = "PASS"
-        elif avg_logp >= -14.0 and not ef:
-            status = "WARNING"
-        elif avg_logp < -14.0 or (mf and ef):
-            status = "FATAL"
-        elif not mf and ef:
-            status = "CRITICAL"
+        # [D·재설계] 동적 z-score: 어미변형 포함 캘리브레이션 분포 기준.
+        z = (avg_logp - self.mu) / self.std if self.std > 0 else 0.0
+        if z >= -3.0:
+            status = "PASS"          # 자료 분포 안(정상 표현 변주 포함)
+        elif z >= -4.5:
+            status = "WARNING"       # 경계
         else:
-            status = "WARNING"
+            status = "FATAL"         # 자료에서 확실히 벗어남(환각)
 
         return {
             "status": status,
             "avg_logp": avg_logp,
-            "mismatch": mismatch,
+            "z_score": round(z, 2),
+            "calib_mu": round(self.mu, 2),
+            "calib_std": round(self.std, 2),
             "elapsed_ms": elapsed_ms,
             "per_token": per,
             "neural_active": self.is_trained,
