@@ -67,6 +67,7 @@ class DocumentVerifier:
             ev = self.nm.evaluate(s)
             status = ev["status"]
             logp = ev.get("avg_logp", 0.0)
+            z = ev.get("z_score", None)
 
             # 판정=설명: 상태에 따라 색과 근거를 함께
             if status == "PASS":
@@ -78,7 +79,7 @@ class DocumentVerifier:
             else:  # SKIP (너무 짧음)
                 color, label = "gray", "판정 보류(짧음)"
 
-            # 설명: 어느 토큰이 가장 근거가 약한지(가장 낮은 logP 토큰)
+            # 설명: 가장 근거 약한 토큰 + PMI 보정 이유(투명)
             weak = ""
             per = ev.get("per_token", [])
             if per:
@@ -86,13 +87,17 @@ class DocumentVerifier:
                 if lowest.get("logp", 0) < -10:
                     weak = lowest.get("raw_token", lowest.get("token", ""))
 
-            note = f"{label} (logP {logp:.1f})"
+            # 판정 근거: z-score(자료 분포 대비 이탈)를 명시 — 판정=설명
+            if z is not None:
+                note = f"{label} (자료 분포 대비 {abs(z):.1f}σ 이탈, logP {logp:.1f})"
+            else:
+                note = f"{label} (logP {logp:.1f})"
             if weak:
                 note += f" · 근거 약한 표현: '{weak}'"
 
             results.append({
                 "sentence": s, "status": status, "avg_logp": round(logp, 2),
-                "color": color, "label": label, "note": note,
+                "z_score": z, "color": color, "label": label, "note": note,
                 "weak_token": weak,
             })
         return results
