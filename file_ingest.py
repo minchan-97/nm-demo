@@ -96,3 +96,4 @@ def _pdf_first_page_png(raw: bytes) -> bytes:
         im = page.to_image(resolution=150).original
         buf = io.BytesIO(); im.save(buf, format="PNG")
         return buf.getvalue()
+
