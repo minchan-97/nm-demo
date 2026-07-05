@@ -37,6 +37,16 @@ if "verifier" not in st.session_state:
     st.session_state.verifier = DocumentVerifier()
 verifier = st.session_state.verifier
 
+# 사이드바: OpenAI 키(있으면 claim 추출에 LLM 사용) + 세션 저장 폴더
+with st.sidebar:
+    st.markdown("### 설정")
+    openai_key = st.text_input("OpenAI Key (선택)", type="password",
+                               help="입력 시 항목-값 추출을 LLM으로. 없으면 규칙 추출.")
+    st.session_state.openai_key = openai_key
+    session_dir = st.text_input("세션 저장 폴더", value="sessions",
+                                help="검증 결과를 pkl로 저장해 문제점 파악에 사용")
+    st.session_state.session_dir = session_dir
+
 col_left, col_right = st.columns([1, 1])
 
 # ── 왼쪽: 자료 투입 + 학습 ──────────────────────────────────
@@ -62,9 +72,19 @@ with col_left:
 
     if corpus_text and st.button("NM 학습(자료 기준 세우기)", type="primary"):
         with st.spinner("자료로 NM 학습 중(CPU, 로컬)..."):
-            verifier.train_on_document(corpus_text)
+            # OpenAI 키 있으면 LLM 추출기 사용(claim 추출), 없으면 규칙 추출
+            llm_extractor = None
+            key = st.session_state.get("openai_key", "")
+            if key:
+                try:
+                    from llm_extractor import make_openai_extractor
+                    llm_extractor = make_openai_extractor(key)
+                except Exception as _e:
+                    st.warning(f"LLM 추출기 준비 실패(규칙 추출로 진행): {_e}")
+            verifier.train_on_document(corpus_text, llm_extractor=llm_extractor)
             st.session_state.corpus_text = corpus_text
-        st.success("NM 학습 완료 — 이 자료가 판정 기준입니다.")
+        mode = "LLM 추출" if llm_extractor else "규칙 추출"
+        st.success(f"NM 학습 완료 — 판정 기준 확립. 항목-값 추출: {mode}")
 
 # ── 오른쪽: LLM 답변 + 검증 ─────────────────────────────────
 with col_right:
@@ -77,7 +97,9 @@ with col_right:
 
         # OpenAI 직접 호출(선택)
         with st.expander("🤖 OpenAI로 답변 생성(선택)"):
-            okey = st.text_input("OpenAI Key", type="password")
+            okey = st.session_state.get("openai_key", "")
+            if not okey:
+                st.caption("사이드바에 OpenAI Key를 넣으면 사용할 수 있어요.")
             question = st.text_input("질문", placeholder="이 자료의 핵심 내용을 요약해줘")
             if st.button("답변 생성") and okey and question:
                 try:
@@ -99,6 +121,7 @@ with col_right:
         if st.button("문장별 검증", type="primary") and answer.strip():
             results = verifier.verify_answer(answer)
             st.session_state.results = results
+            st.session_state.answer = answer
 
 # ── 하단: 검증 결과 (문장별 색 + 주석) ──────────────────────
 results = st.session_state.get("results")
@@ -134,3 +157,60 @@ if results:
 
     st.caption("초록=자료에 근거함 · 노랑=경계(일부 이탈) · 빨강=자료에서 벗어남(환각 가능). "
                "각 판정 옆 logP가 곧 근거 — 판정과 설명이 분리되지 않는다.")
+
+    # ── 층2: 항목-값 사실 검증 (claim) ──────────────────────
+    st.markdown("---")
+    st.subheader("4. 항목-값 사실 검증")
+    st.caption("NM(문장 통계)이 놓치는 '자료에 있는 단어의 틀린 조합'을 잡는다. "
+               "예: 자료엔 '수학여행 10월'인데 답변이 '수학여행 9월'이면, "
+               "단어는 다 자료에 있어 NM은 통과시키지만 여기서 잡힌다.")
+    try:
+        claim_results = verifier.verify_claims(answer)
+    except Exception as _e:
+        claim_results = []
+        st.info(f"항목-값 검증을 실행하지 못했습니다: {_e}")
+
+    if not claim_results:
+        st.write("검출된 항목-값 주장이 없습니다.")
+    else:
+        cmap = {"green": ("#e6f4ea", "#137333", "✅"),
+                "red": ("#fce8e6", "#c5221f", "❌"),
+                "gray": ("#f1f3f4", "#5f6368", "⬜")}
+        for r in claim_results:
+            bg, fg, icon = cmap.get(r["color"], cmap["gray"])
+            path_html = "<br>".join(f"· {p}" for p in r.get("path", []))
+            html = f"""
+            <div style="background:{bg}; border-left:5px solid {fg};
+                        padding:10px 14px; margin:6px 0; border-radius:4px;">
+              <div style="color:#202124; font-size:15px;">
+                 {icon} <b>{r['item']}</b> = {r['value']}
+              </div>
+              <div style="color:{fg}; font-size:13px; margin-top:4px;">{r['reason']}</div>
+              <div style="color:#5f6368; font-size:11px; margin-top:5px;">{path_html}</div>
+            </div>"""
+            st.markdown(html, unsafe_allow_html=True)
+        st.caption("각 판정의 경로(· 로 표시)가 곧 설명이다. "
+                   "LLM이 후보를 뽑고(scribe), 자료 원문이 심판하고, 대조는 투명하다.")
+
+    # ── 세션 저장 (피드백 · 문제점 파악용) ──────────────────
+    st.markdown("---")
+    st.subheader("5. 세션 저장 (문제점 파악용)")
+    st.caption("이 검증 결과를 pkl로 저장해두면, 나중에 '어디서 틀렸나'를 "
+               "되짚어 문제점을 파악할 수 있어요. 실제 문서로 돌려본 기록이 쌓입니다.")
+    fname = st.text_input("저장 파일명", value="session1.pkl")
+    if st.button("💾 이 세션 저장"):
+        try:
+            from session_store import VerificationSession, save_session
+            import os as _os
+            sess = VerificationSession(
+                corpus_preview=st.session_state.get("corpus_text", "")[:300],
+                answer_text=st.session_state.get("answer", ""),
+                nm_results=results,
+                claim_results=claim_results,
+                meta={"saved_by": "app"},
+            )
+            folder = st.session_state.get("session_dir", "sessions")
+            path = save_session(sess, _os.path.join(folder, fname))
+            st.success(f"저장됨: {path}")
+        except Exception as _e:
+            st.error(f"저장 실패: {_e}")
