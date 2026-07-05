@@ -476,3 +476,4 @@ class NeuralMarkovEngine:
             "per_token": per,
             "neural_active": self.is_trained,
         }
+
