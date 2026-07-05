@@ -67,8 +67,14 @@ def normalize_value(value: str, vtype: str):
     v = value.strip()
     if vtype == "date":
         months = [int(m) for m in re.findall(_MONTHS, v)]
-        # '월'을 뗀 순수 숫자(일) 추출은 월과 겹치므로 월 우선 처리
-        return {"months": sorted(set(months)), "raw": v}
+        # 일(day) 추출: 'N일' 형태 + 'M.D' 점 표기(2027.1.8)의 마지막
+        days = [int(d) for d in re.findall(r'(\d{1,2})\s*일', v)]
+        dot = re.findall(r'\d{4}\.\s*(\d{1,2})\.\s*(\d{1,2})', v)  # 2027.1.8
+        for mm, dd in dot:
+            months.append(int(mm)); days.append(int(dd))
+        years = [int(y) for y in re.findall(r'(\d{4})\s*년?', v)]
+        return {"months": sorted(set(months)), "days": sorted(set(days)),
+                "years": sorted(set(years)), "raw": v}
     if vtype == "number":
         nums = re.findall(_NUM, v)
         if nums:
@@ -93,7 +99,7 @@ def rule_extract_claims(answer_text: str) -> list:
             continue
         # 날짜/숫자 값을 찾음
         date_m = re.search(rf'{_MONTHS}\s*({_DAYS})?', s)
-        num_m = re.search(rf'{_NUM}\s*(명|개|시간|학급|반|권|회|층|원)', s)
+        num_m = re.search(rf'{_NUM}\s*(명|개|시간|학급|반|권|회|층|원|일|년|주|차시|교시|주간|일간|시|분|퍼센트|프로|%)', s)
         value, vtype = "", ""
         if date_m:
             value, vtype = date_m.group(0), "date"
@@ -164,37 +170,83 @@ class ClaimVerifier:
                            f"'{claim.item}'이(가) 자료에 없어 검증 불가", path)
         path.append(f"항목 '{claim.item}' 자료에서 {len(contexts)}곳 발견")
 
-        # 2) 그 문맥들에서 같은 타입의 값을 수집 (자료가 말하는 실제 값)
+        # 2) 항목 문맥에서 같은 타입의 값 수집
         doc_values = self._collect_values_near(contexts, claim.value_type)
+
+        # 2-a) 항목 문맥에 값이 없으면 → '틀림'이 아니라 '판단 보류'(회색).
+        #      (표가 뭉개져 값이 다른 줄에 있는 경우가 많음 — 오탐 방지)
         if not doc_values:
-            path.append(f"항목 문맥에 {claim.value_type} 값이 없음")
-            # 값 자체가 자료 항목 문맥에 없으면, 답변 값은 근거 없음
-            return Verdict(claim, "CONTRADICTED", "red",
-                           f"'{claim.item}' 문맥에 {claim.value_type} 정보가 없는데 "
-                           f"답변은 '{claim.value}'라고 주장", path)
+            # 마지막 시도: 답변 값이 자료 어딘가에 항목과 '가까이' 함께 있나?
+            if self._pair_exists_in_corpus(claim.item, claim.value):
+                path.append(f"항목과 값 '{claim.value}'가 자료에 함께 존재")
+                return Verdict(claim, "SUPPORTED", "green",
+                               f"'{claim.item} = {claim.value}' 자료에서 확인", path)
+            path.append(f"항목 문맥에 {claim.value_type} 값을 찾지 못함(표 분리 가능)")
+            return Verdict(claim, "UNVERIFIABLE", "gray",
+                           f"'{claim.item}'의 {claim.value_type} 값을 자료에서 "
+                           f"연결하지 못함 — 사람 확인 필요", path)
         path.append(f"자료의 '{claim.item}' 문맥 값: {sorted(set(doc_values))}")
 
-        # 3) 답변 값 vs 자료 값 대조 (투명한 정규화 비교)
+        # 3) 답변 값이 자료 값과 일치?
         if self._value_matches(claim.value, doc_values, claim.value_type):
             path.append(f"답변 값 '{claim.value}' 가 자료 값과 일치")
             return Verdict(claim, "SUPPORTED", "green",
                            f"'{claim.item} = {claim.value}' 자료와 일치", path,
                            doc_value=", ".join(sorted(set(doc_values))))
-        else:
-            path.append(f"답변 값 '{claim.value}' 가 자료 값과 불일치")
-            return Verdict(claim, "CONTRADICTED", "red",
-                           f"자료의 '{claim.item}'은(는) {sorted(set(doc_values))}인데 "
-                           f"답변은 '{claim.value}' — 불일치(환각 가능)", path,
-                           doc_value=", ".join(sorted(set(doc_values))))
+
+        # 3-b) 불일치 — 근데 신중하게. 답변 값이 자료 어딘가에 항목과
+        #      함께 존재하면(다른 표현/위치) 오탐일 수 있으니 회색.
+        if self._pair_exists_in_corpus(claim.item, claim.value):
+            path.append(f"문맥값과 다르나 '{claim.value}'가 자료 내 항목 근처에 존재 — 보류")
+            return Verdict(claim, "UNVERIFIABLE", "gray",
+                           f"'{claim.item}'의 값이 자료에 여러 개로 보임 "
+                           f"({sorted(set(doc_values))} vs {claim.value}) — 사람 확인 필요",
+                           path, doc_value=", ".join(sorted(set(doc_values))))
+
+        # 3-c) 자료엔 명확한 값이 있고, 답변 값은 자료에 없음 → 불일치(빨강)
+        path.append(f"답변 값 '{claim.value}' 가 자료 값과 불일치, 자료에 없음")
+        return Verdict(claim, "CONTRADICTED", "red",
+                       f"자료의 '{claim.item}'은(는) {sorted(set(doc_values))}인데 "
+                       f"답변은 '{claim.value}' — 불일치(환각 가능)", path,
+                       doc_value=", ".join(sorted(set(doc_values))))
+
+    def _pair_exists_in_corpus(self, item: str, value: str, window: int = 80) -> bool:
+        """항목과 값이 자료에서 window 자 내에 함께 나오나(표 대응)."""
+        key = re.sub(r'\s+', '', item)
+        key = re.sub(r'(은|는|이|가|을|를|의|에|에서|에는)$', '', key)[:6]
+        val = re.sub(r'\s+', '', value)
+        if len(key) < 2 or not val:
+            return False
+        compact = self.corpus.replace(' ', '').replace('\n', ' ')
+        # 항목의 각 등장 위치 주변 window 안에 값이 있나
+        idx = 0
+        while True:
+            p = compact.find(key, idx)
+            if p < 0:
+                break
+            seg = compact[max(0, p - window): p + window + len(key)]
+            # 값의 핵심 숫자/월이 이 조각에 있나
+            core = re.sub(r'(명|개|시간|학급|반|권|회|층|원|일|월|년)', '', val)
+            if core and core in seg.replace(' ', ''):
+                return True
+            idx = p + 1
+        return False
 
     def _collect_values_near(self, contexts: list, vtype: str) -> list:
         vals = []
         for seg in contexts:
             if vtype == "date":
+                # 'N월 N일' 형태
                 for m in re.finditer(rf'{_MONTHS}\s*({_DAYS})?', seg):
                     vals.append(m.group(0))
+                # 점 표기 날짜 (2027.1.8, 7.24 등)
+                for m in re.finditer(r'\d{0,4}\.?\s*\d{1,2}\.\s*\d{1,2}\.?', seg):
+                    vals.append(m.group(0))
+                # 괄호 안 일자 표기 (23), (7~8) — 항목 옆 표
+                for m in re.finditer(r'\((\d{1,2})(~\d{1,2})?\)', seg):
+                    vals.append(m.group(0))
             elif vtype == "number":
-                for m in re.finditer(rf'{_NUM}\s*(명|개|시간|학급|반|권|회|층|원)', seg):
+                for m in re.finditer(rf'{_NUM}\s*(명|개|시간|학급|반|권|회|층|원|일|년|주|차시|교시|주간|일간|시|분|퍼센트|프로|%)', seg):
                     vals.append(m.group(0))
         return vals
 
@@ -203,8 +255,23 @@ class ClaimVerifier:
         for dv in doc_values:
             dn = normalize_value(dv, vtype)
             if vtype == "date":
-                # 월이 겹치면 일치로 봄(간단 규칙)
-                if set(an.get("months", [])) & set(dn.get("months", [])):
+                am, dm = set(an.get("months", [])), set(dn.get("months", []))
+                ad, dd = set(an.get("days", [])), set(dn.get("days", []))
+                # 월이 겹쳐야 함
+                if not (am & dm):
+                    continue
+                # 답변에 일(day)이 있으면 → 그 일이 자료 값에도 있어야 일치
+                # (자료 쪽에 일 정보가 없으면 월만으로 판단 보류는 상위에서)
+                if ad:
+                    if dd and (ad & dd):
+                        return True
+                    elif not dd:
+                        # 자료 값에 일 정보 없음 → 월만 맞음(느슨히 통과)
+                        return True
+                    # 자료에 일이 있는데 안 겹침 → 이 값과는 불일치, 다음 값 확인
+                    continue
+                else:
+                    # 답변에 일 없음 → 월만으로 일치
                     return True
             elif vtype == "number":
                 if an.get("num") is not None and an.get("num") == dn.get("num"):
