@@ -43,9 +43,6 @@ with st.sidebar:
     openai_key = st.text_input("OpenAI Key (선택)", type="password",
                                help="입력 시 항목-값 추출을 LLM으로. 없으면 규칙 추출.")
     st.session_state.openai_key = openai_key
-    session_dir = st.text_input("세션 저장 폴더", value="sessions",
-                                help="검증 결과를 pkl로 저장해 문제점 파악에 사용")
-    st.session_state.session_dir = session_dir
 
 col_left, col_right = st.columns([1, 1])
 
@@ -192,25 +189,59 @@ if results:
         st.caption("각 판정의 경로(· 로 표시)가 곧 설명이다. "
                    "LLM이 후보를 뽑고(scribe), 자료 원문이 심판하고, 대조는 투명하다.")
 
-    # ── 세션 저장 (피드백 · 문제점 파악용) ──────────────────
+    # ── 세션 저장/불러오기 (모바일 대응 · 문제점 파악용) ────
     st.markdown("---")
     st.subheader("5. 세션 저장 (문제점 파악용)")
-    st.caption("이 검증 결과를 pkl로 저장해두면, 나중에 '어디서 틀렸나'를 "
-               "되짚어 문제점을 파악할 수 있어요. 실제 문서로 돌려본 기록이 쌓입니다.")
+    st.caption("검증 결과를 pkl로 폰에 저장해두면, 나중에 다시 올려서 "
+               "'어디서 오탐/미탐했나'를 되짚을 수 있어요. 실제 케이스가 쌓입니다.")
+
+    import io as _io, pickle as _pk
+    from session_store import VerificationSession, analyze_problems
+    from dataclasses import asdict as _asdict
+
     fname = st.text_input("저장 파일명", value="session1.pkl")
-    if st.button("💾 이 세션 저장"):
-        try:
-            from session_store import VerificationSession, save_session
-            import os as _os
-            sess = VerificationSession(
-                corpus_preview=st.session_state.get("corpus_text", "")[:300],
-                answer_text=st.session_state.get("answer", ""),
-                nm_results=results,
-                claim_results=claim_results,
-                meta={"saved_by": "app"},
-            )
-            folder = st.session_state.get("session_dir", "sessions")
-            path = save_session(sess, _os.path.join(folder, fname))
-            st.success(f"저장됨: {path}")
-        except Exception as _e:
-            st.error(f"저장 실패: {_e}")
+    try:
+        sess = VerificationSession(
+            corpus_preview=st.session_state.get("corpus_text", "")[:300],
+            answer_text=st.session_state.get("answer", ""),
+            nm_results=results,
+            claim_results=claim_results,
+            meta={"saved_by": "app"},
+        )
+        # pkl을 메모리에 만들어 다운로드 버튼으로 (모바일=폰에 저장됨)
+        buf = _io.BytesIO()
+        _pk.dump(_asdict(sess), buf)
+        buf.seek(0)
+        st.download_button(
+            "⬇ 이 세션 저장 (폰에 다운로드)",
+            data=buf.getvalue(),
+            file_name=fname if fname.endswith(".pkl") else fname + ".pkl",
+            mime="application/octet-stream",
+        )
+    except Exception as _e:
+        st.error(f"세션 준비 실패: {_e}")
+
+    # ── 저장한 세션 다시 불러와 분석 ──
+    st.markdown("**저장한 세션 다시 분석**")
+    up = st.file_uploader("세션 pkl 불러오기", key="sess_load",
+                          help="이전에 저장한 세션 pkl을 올리면 오탐/미탐을 집계합니다.")
+    if up is not None:
+        if not up.name.lower().endswith(".pkl"):
+            st.warning("`.pkl` 파일만 불러올 수 있어요. (선택: " + up.name + ")")
+        else:
+            try:
+                loaded = _pk.load(_io.BytesIO(up.getvalue()))
+                st.caption(f"불러옴: {up.name} · 답변: "
+                           f"{(loaded.get('answer_text','') or '')[:40]}")
+                st.write(f"NM 판정 {len(loaded.get('nm_results', []))}건 · "
+                         f"claim 판정 {len(loaded.get('claim_results', []))}건 · "
+                         f"피드백 {len(loaded.get('feedback', {}))}건")
+                prob = analyze_problems(loaded)
+                st.write("**문제점 집계:**", prob)
+                # claim 판정 다시 보여주기(오탐 확인용)
+                with st.expander("이 세션의 claim 판정 보기"):
+                    for i, r in enumerate(loaded.get("claim_results", [])):
+                        mk = {"green": "✅", "red": "❌", "gray": "⬜"}.get(r.get("color"), "•")
+                        st.write(f"{mk} [{r.get('item')}={r.get('value')}] {r.get('reason','')[:60]}")
+            except Exception as _e:
+                st.error(f"불러오기 실패: {_e}")
