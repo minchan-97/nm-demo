@@ -15,6 +15,7 @@ import re
 import sys, os
 sys.path.append(os.path.dirname(__file__))
 from neural_markov_engine import NeuralMarkovEngine
+from claim_verify import ClaimVerifier
 
 
 # ── 문장 분리 (한국어 대응) ─────────────────────────────────
@@ -38,18 +39,32 @@ def split_sentences(text):
     return sents
 
 
+import sys, os
+sys.path.append(os.path.dirname(__file__))
+
+
 class DocumentVerifier:
-    """자료로 NM을 학습하고, LLM 답변을 문장 단위로 검증."""
+    """
+    삼자 구조 검증기:
+      1) NM(통계): 문장이 자료 언어 패턴에서 벗어났나 (자료에 없는 표현)
+      2) claim(항목-값): 답변의 항목-값 주장이 자료와 정오 일치하나 (수학여행 9월 vs 10월)
+      3) 판정자: 두 층을 투명 규칙으로 종합. 판정 경로가 곧 설명.
+    """
 
     def __init__(self):
         self.nm = None
         self.trained = False
         self.corpus_preview = ""
+        self.corpus_text = ""
+        self.claim_verifier = None
 
-    def train_on_document(self, corpus_text, embedding_dim=32):
-        """LLM에 준 것과 '같은 자료'로 NM 학습."""
+    def train_on_document(self, corpus_text, embedding_dim=32, llm_extractor=None):
+        """LLM에 준 것과 '같은 자료'로 NM 학습 + claim 심판 준비."""
         self.nm = NeuralMarkovEngine()
         self.nm.train(corpus_text, embedding_dim=embedding_dim)
+        self.corpus_text = corpus_text
+        self.claim_verifier = ClaimVerifier(
+            corpus_text, nm_engine=self.nm, llm_extractor=llm_extractor)
         self.trained = True
         self.corpus_preview = corpus_text[:200]
         return True
@@ -101,6 +116,30 @@ class DocumentVerifier:
                 "weak_token": weak,
             })
         return results
+
+    def verify_claims(self, answer_text):
+        """
+        항목-값 주장(claim) 검증. NM이 못 잡는 '자료에 있는 단어의
+        틀린 조합'(수학여행 9월 vs 10월)을 자료 대조로 잡는다.
+        반환: [{item, value, status, color, reason, path, doc_value}]
+        """
+        if not self.trained:
+            raise RuntimeError("먼저 자료로 학습하세요.")
+        verdicts = self.claim_verifier.verify(answer_text)
+        out = []
+        for v in verdicts:
+            out.append({
+                "item": v.claim.item,
+                "value": v.claim.value,
+                "value_type": v.claim.value_type,
+                "sentence": v.claim.sentence,
+                "status": v.status,
+                "color": v.color,
+                "reason": v.reason,
+                "path": v.path,
+                "doc_value": v.doc_value,
+            })
+        return out
 
     def summary(self, results):
         n = len(results)
