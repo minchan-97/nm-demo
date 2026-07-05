@@ -22,4 +22,3 @@ def tokenize_dual(text):
         n=normalize_token(raw)
         if n: pairs.append((raw,n))
     return pairs
-
