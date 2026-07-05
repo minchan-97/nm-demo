@@ -83,3 +83,4 @@ def tokenize_dual(text):
 def kiwi_available():
     """현재 Kiwi가 로드됐는지."""
     return _get_kiwi() is not None
+
