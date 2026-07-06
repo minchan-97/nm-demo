@@ -24,31 +24,62 @@ def extract_text(filename: str, raw: bytes) -> str:
     return raw.decode("utf-8", errors="ignore")
 
 
+def _looks_garbled(text: str) -> bool:
+    """추출된 텍스트가 깨졌는지 감지(한글 PDF에서 폰트 인코딩 실패 시)."""
+    if not text or len(text) < 20:
+        return False
+    # 정상 한글 음절(가-힣) + 영숫자 + 공백 비율
+    import re
+    total = len(text)
+    valid = len(re.findall(r'[가-힣a-zA-Z0-9\s.,!?()\[\]:;~\-/월일년]', text))
+    # 정상 문자 비율이 낮으면(깨진 글자·조합 자모 과다) 깨진 것으로 봄
+    hangul_jamo = len(re.findall(r'[ㄱ-ㅎㅏ-ㅣ]', text))  # 조합 안된 자모(깨짐 신호)
+    ratio = valid / total
+    return ratio < 0.6 or hangul_jamo > total * 0.15
+
+
 def _extract_pdf(raw: bytes) -> str:
-    # pypdf 우선(pdfplumber보다 ~5배 빠름). 실패 시 pdfplumber 폴백.
+    # pypdf 우선(pdfplumber보다 ~5배 빠름). 실패/깨짐 시 pdfplumber 폴백.
+    pypdf_text = ""
     try:
         import pypdf
         reader = pypdf.PdfReader(io.BytesIO(raw))
         out = []
         for page in reader.pages:
             out.append(page.extract_text() or "")
-        text = "\n".join(out)
-        # pypdf가 텍스트를 거의 못 뽑으면(레이아웃 복잡) 폴백 시도
-        if len(text.strip()) >= 20:
-            return text
+        pypdf_text = "\n".join(out)
+        # 충분히 뽑혔고 + 깨지지 않았으면 사용
+        if len(pypdf_text.strip()) >= 20 and not _looks_garbled(pypdf_text):
+            return pypdf_text
     except Exception:
         pass
-    # 폴백: pdfplumber (느리지만 견고)
+    # 폴백: pdfplumber (느리지만 한글 폰트에 더 견고한 경우 많음)
     try:
         import pdfplumber
+        out = []
+        with pdfplumber.open(io.BytesIO(raw)) as pdf:
+            for page in pdf.pages:
+                t = page.extract_text() or ""
+                out.append(t)
+        plumber_text = "\n".join(out)
+        # 둘 중 안 깨진 쪽 선택
+        if plumber_text.strip() and not _looks_garbled(plumber_text):
+            return plumber_text
+        # 둘 다 깨졌으면 → 경고 표시와 함께 덜 깨진 쪽 반환
+        cand = max([pypdf_text, plumber_text], key=lambda t: len(t.strip()))
+        if _looks_garbled(cand):
+            return ("[⚠ 한글 추출이 깨진 것 같습니다. 이 PDF는 폰트 인코딩 문제로 "
+                    "텍스트가 손상되었습니다. 원본 txt/markdown 또는 docx로 넣어주세요.]\n\n"
+                    + cand)
+        return cand
     except Exception:
-        raise RuntimeError("pdf 추출 라이브러리가 필요해요: pip install pypdf")
-    out = []
-    with pdfplumber.open(io.BytesIO(raw)) as pdf:
-        for page in pdf.pages:
-            t = page.extract_text() or ""
-            out.append(t)
-    return "\n".join(out)
+        pass
+    if pypdf_text.strip():
+        if _looks_garbled(pypdf_text):
+            return ("[⚠ 한글 추출이 깨진 것 같습니다. 원본 txt/markdown/docx로 "
+                    "넣어주세요.]\n\n" + pypdf_text)
+        return pypdf_text
+    raise RuntimeError("pdf 추출 라이브러리가 필요해요: pip install pypdf")
 
 
 def _extract_docx(raw: bytes) -> str:
@@ -110,4 +141,3 @@ def _pdf_first_page_png(raw: bytes) -> bytes:
         im = page.to_image(resolution=150).original
         buf = io.BytesIO(); im.save(buf, format="PNG")
         return buf.getvalue()
-
